@@ -2,52 +2,58 @@
 Protocol definitions for IRC-style chat
 """
 
-
 class Protocol:
     """Message format and command definitions"""
 
-    # Client → Server commands
-    CMD_NICK = "NICK"  # Set nickname
-    CMD_JOIN = "JOIN"  # Join room
-    CMD_LEAVE = "LEAVE"  # Leave room
-    CMD_MSG = "MSG"  # Send message to room
-    CMD_PM = "PM"  # Private message
-    CMD_USERS = "USERS"  # List users in room
-    CMD_ROOMS = "ROOMS"  # List all rooms
-    CMD_WHOAMI = "WHOAMI"  # Get user info
-    CMD_HELP = "HELP"  # Get help
-    CMD_QUIT = "QUIT"  # Disconnect
+    # Existing commands...
+    CMD_NICK = "NICK"
+    CMD_JOIN = "JOIN"
+    CMD_LEAVE = "LEAVE"
+    CMD_MSG = "MSG"
+    CMD_PM = "PM"
+    CMD_USERS = "USERS"
+    CMD_ROOMS = "ROOMS"
+    CMD_WHOAMI = "WHOAMI"
+    CMD_HELP = "HELP"
+    CMD_QUIT = "QUIT"
 
-    # Server → Client responses
-    RPL_WELCOME = "001"  # Welcome message
-    RPL_NICKOK = "002"  # Nickname accepted
-    RPL_NICKERR = "003"  # Nickname rejected
-    RPL_USERLIST = "004"  # User list
-    RPL_JOINED = "005"  # Successfully joined room
-    RPL_ROOMLIST = "006"  # Room list
-    RPL_PM = "007"  # Private message received
-    RPL_INFO = "008"  # User info
+    # NEW: Private room commands
+    CMD_CREATE = "CREATE"       # Create private room
+    CMD_INVITE = "INVITE"       # Invite user to room
+    CMD_KICK = "KICK"           # Kick user from room
+    CMD_BAN = "BAN"             # Ban user from room
+    CMD_SETPASS = "SETPASS"     # Set room password
+    CMD_PRIVATE = "PRIVATE"     # Make room private
+    CMD_PUBLIC = "PUBLIC"       # Make room public
+    CMD_ROOMINFO = "ROOMINFO"   # Get room details
 
-    ERR_NOUSER = "401"  # User not found
-    ERR_NOROOM = "402"  # Room not found
-    ERR_RATELIMIT = "403"  # Rate limit exceeded
+    # Server responses...
+    RPL_WELCOME = "001"
+    RPL_NICKOK = "002"
+    RPL_NICKERR = "003"
+    RPL_USERLIST = "004"
+    RPL_JOINED = "005"
+    RPL_ROOMLIST = "006"
+    RPL_PM = "007"
+    RPL_INFO = "008"
+    RPL_ROOMINFO = "009"        # NEW: Room info response
+
+    ERR_NOUSER = "401"
+    ERR_NOROOM = "402"
+    ERR_RATELIMIT = "403"
+    ERR_NOPERMISSION = "404"    # NEW: No permission
+    ERR_WRONGPASS = "405"       # NEW: Wrong password
 
     @staticmethod
     def encode(command, *args):
-        """
-        Create protocol message
-        Format: COMMAND:arg1:arg2:...\n
-        """
+        """Create protocol message"""
         if args:
             return f"{command}:{':'.join(str(a) for a in args)}\n"
         return f"{command}\n"
 
     @staticmethod
     def decode(message):
-        """
-        Parse protocol message
-        Returns: (command, data)
-        """
+        """Parse protocol message"""
         message = message.strip()
         if ':' in message:
             parts = message.split(':', 1)

@@ -1,5 +1,5 @@
 """
-IRC-style chat server
+IRC-style chat server with private room support
 """
 
 import socket
@@ -8,20 +8,23 @@ import sys
 import signal
 import os
 
-# Add parent directory to path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Add parent directory to Python path to find modules
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.insert(0, parent_dir)
 
+# Now import from the correct paths
 from config import Config
 from shared.protocol import Protocol
 from shared.validators import InputValidator
-from room_manager import RoomManager  # Changed from server.room_manager
-from rate_limiter import RateLimiter  # Changed from server.rate_limiter
 
-
-
+# Import from same directory (server/)
+sys.path.insert(0, current_dir)
+from room_manager import RoomManager
+from rate_limiter import RateLimiter
 
 class ChatServer:
-    """Main chat server"""
+    """Main chat server with private room support"""
 
     def __init__(self):
         self.host = Config.HOST
@@ -36,9 +39,9 @@ class ChatServer:
         self.running = False
         self.server_socket = None
 
-        # Create default rooms
+        # Create default public rooms
         for room in Config.DEFAULT_ROOMS:
-            self.room_manager.create_room(room)
+            self.room_manager.create_room(room, owner="Server")
 
         # Setup signal handler
         signal.signal(signal.SIGINT, self.signal_handler)
@@ -58,9 +61,14 @@ class ChatServer:
             self.server_socket.listen(5)
             self.running = True
 
-            print(f"[SERVER] {Config.SERVER_NAME} v{Config.VERSION}")
+            print("=" * 60)
+            print(f"  {Config.SERVER_NAME} v{Config.VERSION}")
+            print("=" * 60)
             print(f"[SERVER] Listening on {self.host}:{self.port}")
+            print(f"[SERVER] Max clients: {Config.MAX_CLIENTS}")
+            print(f"[SERVER] Default rooms: {', '.join(Config.DEFAULT_ROOMS)}")
             print(f"[SERVER] Press Ctrl+C to stop")
+            print("=" * 60)
 
             while self.running:
                 try:
@@ -71,6 +79,7 @@ class ChatServer:
                         if len(self.clients) >= Config.MAX_CLIENTS:
                             client_socket.send(b"SERVER_FULL\n")
                             client_socket.close()
+                            print(f"[REJECTED] {address[0]}:{address[1]} (server full)")
                             continue
 
                     # Handle client in new thread
@@ -166,6 +175,30 @@ class ChatServer:
                 elif command == Protocol.CMD_HELP:
                     self.handle_help(client_socket)
 
+                elif command == Protocol.CMD_CREATE:
+                    self.handle_create(client_socket, nickname, args)
+
+                elif command == Protocol.CMD_INVITE:
+                    self.handle_invite(client_socket, nickname, args)
+
+                elif command == Protocol.CMD_KICK:
+                    self.handle_kick(client_socket, nickname, args)
+
+                elif command == Protocol.CMD_BAN:
+                    self.handle_ban(client_socket, nickname, args)
+
+                elif command == Protocol.CMD_SETPASS:
+                    self.handle_setpass(client_socket, nickname, args)
+
+                elif command == Protocol.CMD_PRIVATE:
+                    self.handle_make_private(client_socket, nickname, args)
+
+                elif command == Protocol.CMD_PUBLIC:
+                    self.handle_make_public(client_socket, nickname, args)
+
+                elif command == Protocol.CMD_ROOMINFO:
+                    self.handle_roominfo(client_socket, nickname, args)
+
                 elif command == Protocol.CMD_QUIT:
                     break
 
@@ -242,12 +275,13 @@ class ChatServer:
 
         # Auto-join default room if first time
         if not old_nickname:
-            self.room_manager.join_room(nickname, Config.AUTO_JOIN_ROOM)
-            self.broadcast_to_room(
-                Config.AUTO_JOIN_ROOM,
-                f"[SERVER] {nickname} has joined #{Config.AUTO_JOIN_ROOM}",
-                client_socket
-            )
+            success, error = self.room_manager.join_room(nickname, Config.AUTO_JOIN_ROOM)
+            if success:
+                self.broadcast_to_room(
+                    Config.AUTO_JOIN_ROOM,
+                    f"[SERVER] {nickname} has joined #{Config.AUTO_JOIN_ROOM}",
+                    client_socket
+                )
             print(f"[CONNECT] {nickname} ({address[0]}:{address[1]})")
         else:
             # Announce name change
@@ -262,12 +296,16 @@ class ChatServer:
         return nickname
 
     def handle_join(self, client_socket, nickname, room_name):
-        """Handle join room command"""
+        """Handle join room command with password support"""
         if not nickname:
             client_socket.send(b"Set nickname first with /nick <name>\n")
             return
 
-        room_name = InputValidator.sanitize_room_name(room_name)
+        # Parse: room[:password]
+        parts = room_name.split(':', 1)
+        room_name = InputValidator.sanitize_room_name(parts[0])
+        password = parts[1] if len(parts) > 1 else None
+
         if not room_name:
             client_socket.send(b"Invalid room name\n")
             return
@@ -275,8 +313,13 @@ class ChatServer:
         # Get old room
         old_room = self.room_manager.get_user_room(nickname)
 
-        # Join new room
-        self.room_manager.join_room(nickname, room_name)
+        # Try to join new room
+        success, error = self.room_manager.join_room(nickname, room_name, password)
+
+        if not success:
+            error_msg = Protocol.encode(Protocol.ERR_NOPERMISSION, error)
+            client_socket.send(error_msg.encode('utf-8'))
+            return
 
         # Announce in old room
         if old_room and old_room != room_name:
@@ -298,7 +341,7 @@ class ChatServer:
         msg = Protocol.encode(
             Protocol.RPL_JOINED,
             room_name,
-            f"Users in #{room_name}: {', '.join(users)}"
+            f"Joined #{room_name}. Users: {', '.join(users)}"
         )
         client_socket.send(msg.encode('utf-8'))
 
@@ -412,11 +455,13 @@ class ChatServer:
             client_socket.send(b"No rooms available\n")
             return
 
-        rooms_str = '\n'.join(
-            f"  #{name} ({info['count']} users)"
-            for name, info in sorted(rooms.items())
-        )
-        msg = Protocol.encode(Protocol.RPL_ROOMLIST, f"Available rooms:\n{rooms_str}")
+        rooms_str = "Available rooms:\n"
+        for name, info in sorted(rooms.items()):
+            room_type = "🔒 Private" if info['is_private'] else "🌐 Public"
+            password = " 🔑" if info['has_password'] else ""
+            rooms_str += f"  #{name} ({info['count']} users) {room_type}{password}\n"
+
+        msg = Protocol.encode(Protocol.RPL_ROOMLIST, rooms_str)
         client_socket.send(msg.encode('utf-8'))
 
     def handle_whoami(self, client_socket, nickname, address):
@@ -426,10 +471,15 @@ class ChatServer:
             return
 
         room = self.room_manager.get_user_room(nickname)
+        room_info = self.room_manager.get_room_info(room) if room else None
+
         info = f"""Your Info:
   Nickname: {nickname}
   Room: #{room or 'none'}
   Address: {address[0]}:{address[1]}"""
+
+        if room_info and room_info['owner'] == nickname:
+            info += f"\n  Status: Room owner of #{room}"
 
         msg = Protocol.encode(Protocol.RPL_INFO, info)
         client_socket.send(msg.encode('utf-8'))
@@ -437,23 +487,258 @@ class ChatServer:
     def handle_help(self, client_socket):
         """Handle help command"""
         help_text = """
-Available Commands:
-  /nick <name>        Set your nickname
-  /join <room>        Join a chat room
-  /leave              Leave current room
-  /msg <user> <text>  Send private message
-  /users              List users in current room
-  /rooms              List all rooms
-  /whoami             Show your info
-  /help               Show this help
-  /quit               Disconnect
+╔════════════════════════════════════════╗
+║         AVAILABLE COMMANDS             ║
+╚════════════════════════════════════════╝
 
-Tips:
-  - Messages without / are sent to your current room
-  - Room names are case-insensitive
-  - Use /join to switch between rooms
+BASIC COMMANDS:
+  /nick <name>           Set your nickname
+  /join <room>[:pass]    Join a room (with optional password)
+  /leave                 Leave current room
+  /msg <user> <text>     Send private message
+  /users                 List users in current room
+  /rooms                 List all rooms
+  /whoami                Show your info
+  /help                  Show this help
+  /quit                  Disconnect
+
+PRIVATE ROOM COMMANDS:
+  /create <room> [pass] [topic]  Create a private room
+  /invite <user> [room]          Invite user to private room
+  /kick <user> [room]            Kick user from room (owner only)
+  /ban <user> [room]             Ban user from room (owner only)
+  /password <pass> [room]        Set room password (owner only)
+  /private [room]                Make room private (owner only)
+  /public [room]                 Make room public (owner only)
+  /roominfo [room]               Show room details
+
+EXAMPLES:
+  Create private room:   /create myroom secretpass Private chat
+  Join with password:    /join myroom:secretpass
+  Invite user:           /invite Alice myroom
+  Make room private:     /private myroom
+  
+TIPS:
+  • Messages without / are sent to your current room
+  • Use /roominfo to see room details and permissions
+  • Only room owners can manage their rooms
 """
         client_socket.send(help_text.encode('utf-8'))
+
+    def handle_create(self, client_socket, nickname, args):
+        """Handle create private room command"""
+        if not nickname:
+            client_socket.send("Set nickname first with /nick <name>\n".encode('utf-8'))  # Fixed
+            return
+
+        # Parse: room_name[:password[:topic]]
+        parts = args.split(':', 2)
+        room_name = InputValidator.sanitize_room_name(parts[0])
+        password = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+        topic = parts[2].strip() if len(parts) > 2 else ""
+
+        if not room_name:
+            client_socket.send("Invalid room name\n".encode('utf-8'))  # Fixed
+            return
+
+        # Create private room
+        success = self.room_manager.create_room(
+            room_name,
+            topic=topic,
+            is_private=True,
+            password=password,
+            owner=nickname
+        )
+
+        if success:
+            # Auto-join creator
+            self.room_manager.join_room(nickname, room_name, password)
+            msg = f"✓ Created private room #{room_name}"
+            if password:
+                msg += " (password protected)"
+            if topic:
+                msg += f"\n  Topic: {topic}"
+            client_socket.send((msg + "\n").encode('utf-8'))
+            print(f"[ROOM CREATED] #{room_name} by {nickname}")
+        else:
+            client_socket.send("✗ Room already exists\n".encode('utf-8'))  # Fixed
+
+    def handle_invite(self, client_socket, nickname, args):
+        """Handle invite user to room command"""
+        if not nickname:
+            return
+
+        # Parse: user[:room]
+        parts = args.split(':', 1)
+        invitee = parts[0].strip()
+        room_name = parts[1].strip() if len(parts) > 1 else self.room_manager.get_user_room(nickname)
+
+        if not room_name:
+            client_socket.send("Specify room or join one first\n".encode('utf-8'))  # Fixed
+            return
+
+        success, error = self.room_manager.invite_user(room_name, nickname, invitee)
+
+        if success:
+            client_socket.send(f"✓ Invited {invitee} to #{room_name}\n".encode('utf-8'))
+
+            # Notify invitee if online
+            self.notify_user(invitee,
+                             f"[SERVER] 📨 You've been invited to #{room_name} by {nickname}. Use /join {room_name} to join.")
+            print(f"[INVITE] {nickname} invited {invitee} to #{room_name}")
+        else:
+            client_socket.send(f"✗ Error: {error}\n".encode('utf-8'))
+
+    def handle_kick(self, client_socket, nickname, args):
+        """Handle kick user from room command"""
+        if not nickname:
+            return
+
+        # Parse: user[:room]
+        parts = args.split(':', 1)
+        kickee = parts[0].strip()
+        room_name = parts[1].strip() if len(parts) > 1 else self.room_manager.get_user_room(nickname)
+
+        if not room_name:
+            client_socket.send("Specify room or join one first\n".encode('utf-8'))  # Fixed
+            return
+
+        success, error = self.room_manager.kick_user(room_name, nickname, kickee)
+
+        if success:
+            self.broadcast_to_room(
+                room_name,
+                f"[SERVER] ⚠️ {kickee} was kicked by {nickname}"
+            )
+            self.notify_user(kickee, f"[SERVER] You were kicked from #{room_name} by {nickname}")
+            print(f"[KICK] {nickname} kicked {kickee} from #{room_name}")
+        else:
+            client_socket.send(f"✗ Error: {error}\n".encode('utf-8'))
+
+    def handle_ban(self, client_socket, nickname, args):
+        """Handle ban user from room command"""
+        if not nickname:
+            return
+
+        # Parse: user[:room]
+        parts = args.split(':', 1)
+        banee = parts[0].strip()
+        room_name = parts[1].strip() if len(parts) > 1 else self.room_manager.get_user_room(nickname)
+
+        if not room_name:
+            client_socket.send("Specify room or join one first\n".encode('utf-8'))  # Fixed
+            return
+
+        success, error = self.room_manager.ban_user(room_name, nickname, banee)
+
+        if success:
+            self.broadcast_to_room(
+                room_name,
+                f"[SERVER] 🚫 {banee} was banned by {nickname}"
+            )
+            self.notify_user(banee, f"[SERVER] You were banned from #{room_name} by {nickname}")
+            print(f"[BAN] {nickname} banned {banee} from #{room_name}")
+        else:
+            client_socket.send(f"✗ Error: {error}\n".encode('utf-8'))
+
+    def handle_setpass(self, client_socket, nickname, args):
+        """Handle set room password command"""
+        if not nickname:
+            return
+
+        # Parse: password[:room]
+        parts = args.split(':', 1)
+        password = parts[0].strip()
+        room_name = parts[1].strip() if len(parts) > 1 else self.room_manager.get_user_room(nickname)
+
+        if not room_name:
+            client_socket.send("Specify room or join one first\n".encode('utf-8'))  # Fixed
+            return
+
+        success, error = self.room_manager.set_room_password(room_name, nickname, password)
+
+        if success:
+            client_socket.send(f"✓ Password set for #{room_name}\n".encode('utf-8'))
+            self.broadcast_to_room(
+                room_name,
+                f"[SERVER] 🔒 Room password has been set by {nickname}",
+                client_socket
+            )
+            print(f"[PASSWORD] {nickname} set password for #{room_name}")
+        else:
+            client_socket.send(f"✗ Error: {error}\n".encode('utf-8'))
+
+    def handle_make_private(self, client_socket, nickname, args):
+        """Handle make room private command"""
+        if not nickname:
+            return
+
+        room_name = args.strip() or self.room_manager.get_user_room(nickname)
+
+        if not room_name:
+            client_socket.send("Specify room or join one first\n".encode('utf-8'))  # Fixed
+            return
+
+        success, error = self.room_manager.make_private(room_name, nickname)
+
+        if success:
+            self.broadcast_to_room(
+                room_name,
+                f"[SERVER] 🔒 This room is now private (invite-only)"
+            )
+            print(f"[PRIVATE] #{room_name} made private by {nickname}")
+        else:
+            client_socket.send(f"✗ Error: {error}\n".encode('utf-8'))
+
+    def handle_make_public(self, client_socket, nickname, args):
+        """Handle make room public command"""
+        if not nickname:
+            return
+
+        room_name = args.strip() or self.room_manager.get_user_room(nickname)
+
+        if not room_name:
+            client_socket.send("Specify room or join one first\n".encode('utf-8'))  # Fixed
+            return
+
+        success, error = self.room_manager.make_public(room_name, nickname)
+
+        if success:
+            self.broadcast_to_room(
+                room_name,
+                f"[SERVER] 🌐 This room is now public"
+            )
+            print(f"[PUBLIC] #{room_name} made public by {nickname}")
+        else:
+            client_socket.send(f"✗ Error: {error}\n".encode('utf-8'))
+
+    def handle_roominfo(self, client_socket, nickname, args):
+        """Handle room info command"""
+        room_name = args.strip() or self.room_manager.get_user_room(nickname)
+
+        if not room_name:
+            client_socket.send("Specify a room name\n".encode('utf-8'))  # Fixed
+            return
+
+        info = self.room_manager.get_room_info(room_name)
+
+        if info:
+            room_type = "🔒 Private (invite-only)" if info['is_private'] else "🌐 Public"
+            password = "🔑 Yes" if info['has_password'] else "No"
+
+            msg = f"""
+    ╔════════════════════════════════════════╗
+    ║         ROOM INFO: #{info['name']}
+    ╚════════════════════════════════════════╝
+      Topic: {info['topic'] or 'No topic set'}
+      Owner: {info['owner']}
+      Type: {room_type}
+      Password: {password}
+      Users ({info['user_count']}): {', '.join(info['users'])}
+    """
+            client_socket.send(msg.encode('utf-8'))
+        else:
+            client_socket.send("✗ Room not found\n".encode('utf-8'))  # Fixed
 
     def broadcast_to_room(self, room_name, message, sender_socket=None):
         """Broadcast message to all users in room except sender"""
@@ -468,12 +753,21 @@ Tips:
                         except:
                             pass
 
+    def notify_user(self, nickname, message):
+        """Send notification to a specific user"""
+        with self.clients_lock:
+            for socket, info in self.clients.items():
+                if info['nickname'] == nickname:
+                    try:
+                        socket.send((message + '\n').encode('utf-8'))
+                    except:
+                        pass
+                    break
 
 def main():
     """Main entry point"""
     server = ChatServer()
     server.start()
-
 
 if __name__ == "__main__":
     main()
